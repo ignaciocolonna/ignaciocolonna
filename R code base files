@@ -1,0 +1,247 @@
+# ---- packages ----
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(emmeans)
+library(readxl)   # only if reading from Excel
+
+# ---- user inputs (EDIT THESE) ----
+
+# 1) Read your data (uncomment one)
+library(readxl)
+
+Rio_dat<- read_excel("~/Library/CloudStorage/OneDrive-SharedLibraries-AgriThority/AgriThority - Documents/Client Archive/Rio Nutrition/RIO24103 - Rhyzogreen Alfalfa TrialWerx/Data/RIO24103 - Rhyzogreen Alfalfa TrialWerx_base.xlsx", 
+                                                       sheet = "Data time down")
+
+df <- Rio_dat  # <- if your data.frame already exists in the session, leave this
+
+# 2) Names of the factor columns
+trt_col <- "Trt_Name"
+rep_col <- "Rep"
+
+# 3) Optional grouping columns: set to c("Location","Time") if you want separate ANOVAs per group,
+#    or set to character(0) if you want one overall ANOVA per response.
+group_cols <- c("Location")  # or: character(0)
+group_cols
+# 4) Choose your response columns by NAME RANGE (recommended) or by explicit vector
+#    Example using a name range (inclusive):
+from_col <- "Yld.Lbs_Acre"
+to_col   <- "Yld.Lbs_Acre"
+response_cols <- names(df)[match(from_col, names(df)) : match(to_col, names(df))]
+response_cols
+trt_col
+
+# --- PRE-CLEAN: keep rows that have at least one non-NA among the responses
+df <- df %>%
+  dplyr::filter(dplyr::if_any(dplyr::all_of(response_cols), ~ !is.na(.))) %>%
+  dplyr::mutate(
+    dplyr::across(dplyr::all_of(c(trt_col, rep_col, group_cols)), as.factor)
+  )
+
+head(df,n=200)
+
+# 2) HELPERS (place here, BEFORE fit_one)
+safe_name <- function(x) {
+  if (grepl("^[A-Za-z.][A-Za-z0-9._]*$", x)) x else paste0("`", x, "`")
+}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# ---- helper: run one ANOVA + emmeans for a single response within a (grouped) slice ----
+fit_one <- function(d, y, trt_col, rep_col) {
+  # Keep only rows with a value for this response
+  d2 <- d %>% dplyr::filter(!is.na(.data[[y]]))
+  
+  # Drop empty slices quickly
+  if (nrow(d2) < 3) {
+    return(list(
+      summary_row = tibble::tibble(
+        Response = y, p_Trt = NA_real_, CV_pct = NA_real_, R2 = NA_real_, sigma = NA_real_,
+        Rep_in_model = NA, Note = "Too few rows after NA drop"
+      ),
+      pairs = dplyr::tibble(
+        Response = y, Trt1 = character(), Trt2 = character(),
+        Diff = numeric(), SE = numeric(), df = numeric(), t = numeric(), p = numeric(),
+        Mean_Trt1 = numeric(), Mean_Trt2 = numeric()
+      )
+    ))
+  }
+  
+  # Ensure factors and drop unused levels
+  d2[[trt_col]] <- droplevels(as.factor(d2[[trt_col]]))
+  d2[[rep_col]] <- droplevels(as.factor(d2[[rep_col]]))
+  
+  n_trt <- dplyr::n_distinct(d2[[trt_col]])
+  n_rep <- dplyr::n_distinct(d2[[rep_col]])
+  
+  # If treatment has <2 levels, no ANOVA possible
+  if (n_trt < 2) {
+    return(list(
+      summary_row = tibble::tibble(
+        Response = y, p_Trt = NA_real_, CV_pct = NA_real_, R2 = NA_real_, sigma = NA_real_,
+        Rep_in_model = NA, Note = "Trt has < 2 levels in this slice"
+      ),
+      pairs = dplyr::tibble(
+        Response = y, Trt1 = character(), Trt2 = character(),
+        Diff = numeric(), SE = numeric(), df = numeric(), t = numeric(), p = numeric(),
+        Mean_Trt1 = numeric(), Mean_Trt2 = numeric()
+      )
+    ))
+  }
+  
+  # Build formula; if Rep has <2 levels, drop Rep from the model and flag it
+  rep_in_model <- n_rep >= 2
+  rhs <- if (rep_in_model) {
+    sprintf("%s + %s", safe_name(trt_col), safe_name(rep_col))
+  } else {
+    safe_name(trt_col)
+  }
+  form <- as.formula(sprintf("%s ~ %s", safe_name(y), rhs))
+  
+  # Fit
+  m <- tryCatch(lm(form, data = d2), error = function(e) NULL)
+  if (is.null(m)) {
+    return(list(
+      summary_row = tibble::tibble(
+        Response = y, p_Trt = NA_real_, CV_pct = NA_real_, R2 = NA_real_, sigma = NA_real_,
+        Rep_in_model = rep_in_model, Note = "Model failed to fit"
+      ),
+      pairs = dplyr::tibble(
+        Response = y, Trt1 = character(), Trt2 = character(),
+        Diff = numeric(), SE = numeric(), df = numeric(), t = numeric(), p = numeric(),
+        Mean_Trt1 = numeric(), Mean_Trt2 = numeric()
+      )
+    ))
+  }
+  
+  # Core stats
+  aov_tab <- anova(m)
+  p_trt <- tryCatch(aov_tab[rownames(aov_tab) == trt_col, "Pr(>F)"], error = function(e) NA_real_)
+  sig <- sigma(m)
+  r2  <- summary(m)$r.squared %||% NA_real_
+  mn  <- mean(d2[[y]], na.rm = TRUE)
+  cv  <- if (is.finite(mn) && mn != 0) 100 * sig / mn else NA_real_
+  
+  # emmeans (skip if it fails)
+  em <- tryCatch(
+    emmeans::emmeans(m, specs = as.formula(paste0("~ ", safe_name(trt_col)))),
+    error = function(e) NULL
+  )
+  
+  if (is.null(em)) {
+    return(list(
+      summary_row = tibble::tibble(
+        Response = y, p_Trt = p_trt, CV_pct = cv, R2 = r2, sigma = sig,
+        Rep_in_model = rep_in_model, Note = "emmeans failed"
+      ),
+      pairs = dplyr::tibble(
+        Response = y, Trt1 = character(), Trt2 = character(),
+        Diff = numeric(), SE = numeric(), df = numeric(), t = numeric(), p = numeric(),
+        Mean_Trt1 = numeric(), Mean_Trt2 = numeric()
+      )
+    ))
+  }
+  
+  means_df <- tibble::as_tibble(em) %>%
+    dplyr::transmute(Trt = .data[[trt_col]], Mean = emmean)
+  
+  pairs_df <- tryCatch(
+    {
+      tibble::as_tibble(emmeans::contrast(em, method = "pairwise", adjust = "none")) %>%
+        tidyr::separate(contrast, into = c("Trt1","Trt2"), sep = " - ", remove = TRUE) %>%
+        dplyr::left_join(dplyr::rename(means_df, Trt1 = Trt, Mean_Trt1 = Mean), by = "Trt1") %>%
+        dplyr::left_join(dplyr::rename(means_df, Trt2 = Trt, Mean_Trt2 = Mean), by = "Trt2") %>%
+        dplyr::transmute(
+          Response = y, Trt1, Trt2,
+          Diff = estimate, SE = SE, df = df, t = t.ratio, p = p.value,
+          Mean_Trt1, Mean_Trt2
+        )
+    },
+    error = function(e) dplyr::tibble(
+      Response = y, Trt1 = character(), Trt2 = character(),
+      Diff = numeric(), SE = numeric(), df = numeric(), t = numeric(), p = numeric(),
+      Mean_Trt1 = numeric(), Mean_Trt2 = numeric()
+    )
+  )
+  
+  list(
+    summary_row = tibble::tibble(
+      Response = y, p_Trt = p_trt, CV_pct = cv, R2 = r2, sigma = sig,
+      Rep_in_model = rep_in_model, Note = NA_character_
+    ),
+    pairs = pairs_df
+  )
+}
+
+
+# ---- main driver: loop over groups and responses ----
+analyze_all <- function(df, response_cols, trt_col, rep_col, group_cols = character(0)) {
+  if (length(group_cols)) {
+    df_split <- df %>%
+      group_by(across(all_of(group_cols))) %>%
+      group_split(.keep = TRUE)
+  } else {
+    df_split <- list(df)
+  }
+  
+  results <- purrr::map(df_split, function(d_slice) {
+    hdr <- d_slice %>% dplyr::distinct(dplyr::across(dplyr::all_of(group_cols)))
+    cat("\n=== analyzing slice ===\n"); print(hdr)
+    # capture group values for later columns
+    group_vals <- if (length(group_cols)) {
+      d_slice %>% distinct(across(all_of(group_cols))) %>% slice(1)
+    } else {
+      tibble(.rows = 1)
+    }
+    
+    out_list <- map(response_cols, ~ fit_one(d_slice, .x, trt_col, rep_col))
+    
+    # bind per-slice outputs
+    summary_tbl <- map_dfr(out_list, "summary_row")
+    pairs_tbl   <- map_dfr(out_list, "pairs")
+    
+    # add grouping columns (if any)
+    if (ncol(group_vals)) {
+      summary_tbl <- group_vals %>% cross_join(summary_tbl)
+      pairs_tbl   <- group_vals %>% cross_join(pairs_tbl)
+    }
+    
+    list(summary = summary_tbl, pairs = pairs_tbl)
+  })
+  
+  # combine slices
+  summary_all <- map_dfr(results, "summary")
+  pairs_all   <- map_dfr(results, "pairs")
+  
+  # arrange for readability
+  if (length(group_cols)) {
+    summary_all <- summary_all %>% arrange(across(all_of(group_cols)), Response)
+    pairs_all   <- pairs_all %>% arrange(across(all_of(group_cols)), Response, Trt1, Trt2)
+  } else {
+    summary_all <- summary_all %>% arrange(Response)
+    pairs_all   <- pairs_all %>% arrange(Response, Trt1, Trt2)
+  }
+  
+  list(summary = summary_all, pairs = pairs_all)
+}
+
+# ---- run it ----
+res <- analyze_all(
+  df          = df,
+  response_cols = response_cols,
+  trt_col     = trt_col,
+  rep_col     = rep_col,
+  group_cols  = group_cols
+)
+
+trt_summary <- res$summary   # Table 1: p(Trt Name), CV%, R2, sigma
+trt_pairs   <- res$pairs     # Table 2: all unadjusted pairwise comparisons with means
+
+# ---- (optional) write to files ----
+readr::write_csv(trt_summary, "anova_summary_by_response_yieldmean.csv")
+readr::write_csv(trt_pairs,   "anova_unadjusted_pairwise_yieldmean.csv")
+
+# Quick peek
+print(trt_summary, n = 200)
+print(trt_pairs, n = 200)
+
